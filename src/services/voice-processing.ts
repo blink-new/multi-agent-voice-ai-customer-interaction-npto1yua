@@ -10,6 +10,7 @@ export class VoiceProcessingEngine {
   private silenceTimer: NodeJS.Timeout | null = null
   private interruptionBuffer: Blob[] = []
   private currentProcessingId: string | null = null
+  private currentAudio: HTMLAudioElement | null = null
 
   // Advanced interruption handling
   private readonly SILENCE_THRESHOLD = 0.01
@@ -18,8 +19,78 @@ export class VoiceProcessingEngine {
   private readonly MAX_PROCESSING_TIME = 200 // 200ms target
   private readonly CHUNK_SIZE = 1024
 
+  static checkBrowserCompatibility(): { supported: boolean; issues: string[] } {
+    const issues: string[] = []
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      issues.push('getUserMedia not supported')
+    }
+
+    if (!window.MediaRecorder) {
+      issues.push('MediaRecorder not supported')
+    }
+
+    if (!window.AudioContext && !(window as any).webkitAudioContext) {
+      issues.push('AudioContext not supported')
+    }
+
+    if (!window.FileReader) {
+      issues.push('FileReader not supported')
+    }
+
+    return {
+      supported: issues.length === 0,
+      issues
+    }
+  }
+
+  private getSupportedMimeType(): { mimeType: string; bitrate: number } {
+    // List of MIME types to try in order of preference
+    const mimeTypes = [
+      { mimeType: 'audio/webm;codecs=opus', bitrate: 16000 },
+      { mimeType: 'audio/webm', bitrate: 16000 },
+      { mimeType: 'audio/mp4', bitrate: 16000 },
+      { mimeType: 'audio/ogg;codecs=opus', bitrate: 16000 },
+      { mimeType: 'audio/wav', bitrate: 16000 },
+      { mimeType: 'audio/mpeg', bitrate: 16000 }
+    ]
+
+    // Find the first supported MIME type
+    for (const format of mimeTypes) {
+      if (MediaRecorder.isTypeSupported(format.mimeType)) {
+        console.log(`Using supported MIME type: ${format.mimeType}`)
+        return format
+      }
+    }
+
+    // Fallback to default (should work on most browsers)
+    console.warn('No preferred MIME type supported, using default')
+    return { mimeType: '', bitrate: 16000 }
+  }
+
+  private async checkMediaRecorderSupport(): Promise<boolean> {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      console.error('getUserMedia not supported')
+      return false
+    }
+
+    if (!window.MediaRecorder) {
+      console.error('MediaRecorder not supported')
+      return false
+    }
+
+    return true
+  }
+
   async initialize(): Promise<void> {
     try {
+      // Check browser support first
+      const isSupported = await this.checkMediaRecorderSupport()
+      if (!isSupported) {
+        throw new Error('Browser does not support required audio features')
+      }
+
+      // Request microphone access with optimized settings
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: {
           echoCancellation: true,
@@ -30,7 +101,14 @@ export class VoiceProcessingEngine {
         }
       })
 
+      // Initialize audio context
       this.audioContext = new AudioContext({ sampleRate: 16000 })
+      
+      // Resume audio context if suspended (required by some browsers)
+      if (this.audioContext.state === 'suspended') {
+        await this.audioContext.resume()
+      }
+
       this.analyser = this.audioContext.createAnalyser()
       this.analyser.fftSize = 2048
       this.analyser.smoothingTimeConstant = 0.8
@@ -38,15 +116,32 @@ export class VoiceProcessingEngine {
       const source = this.audioContext.createMediaStreamSource(this.stream)
       source.connect(this.analyser)
 
-      this.mediaRecorder = new MediaRecorder(this.stream, {
-        mimeType: 'audio/webm;codecs=opus',
-        audioBitsPerSecond: 16000
-      })
+      // Find supported MIME type with fallbacks
+      const supportedMimeType = this.getSupportedMimeType()
+      
+      // Create MediaRecorder with proper error handling
+      try {
+        if (supportedMimeType.mimeType) {
+          this.mediaRecorder = new MediaRecorder(this.stream, {
+            mimeType: supportedMimeType.mimeType,
+            audioBitsPerSecond: supportedMimeType.bitrate
+          })
+        } else {
+          // Fallback without specifying MIME type
+          this.mediaRecorder = new MediaRecorder(this.stream)
+        }
+      } catch (error) {
+        console.warn('Failed to create MediaRecorder with preferred settings, using defaults:', error)
+        this.mediaRecorder = new MediaRecorder(this.stream)
+      }
 
       this.setupRecordingHandlers()
       this.startVoiceActivityDetection()
+      
+      console.log('Voice processing engine initialized successfully')
     } catch (error) {
       console.error('Failed to initialize voice processing:', error)
+      this.cleanup()
       throw error
     }
   }
@@ -65,17 +160,28 @@ export class VoiceProcessingEngine {
     this.mediaRecorder.onstop = async () => {
       if (audioChunks.length === 0) return
 
-      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' })
+      const audioBlob = new Blob(audioChunks, { 
+        type: this.mediaRecorder?.mimeType || 'audio/webm' 
+      })
       audioChunks = []
 
       // Process audio with interruption handling
       await this.processAudioWithInterruption(audioBlob)
+    }
+
+    this.mediaRecorder.onerror = (event) => {
+      console.error('MediaRecorder error:', event)
+    }
+
+    this.mediaRecorder.onstart = () => {
+      console.log('Recording started')
     }
   }
 
   private async processAudioWithInterruption(audioBlob: Blob): Promise<void> {
     const processingId = Date.now().toString()
     this.currentProcessingId = processingId
+    this.isProcessing = true
 
     try {
       const startTime = performance.now()
@@ -93,6 +199,12 @@ export class VoiceProcessingEngine {
       }
 
       const sttTime = performance.now() - startTime
+
+      // Skip empty or very short transcriptions
+      if (!transcriptionResult.text.trim() || transcriptionResult.text.length < 3) {
+        console.log('Skipping empty or very short transcription')
+        return
+      }
 
       // GPT processing with context awareness
       const gptStartTime = performance.now()
@@ -122,6 +234,8 @@ export class VoiceProcessingEngine {
 
     } catch (error) {
       console.error('Voice processing error:', error)
+    } finally {
+      this.isProcessing = false
     }
   }
 
@@ -188,16 +302,24 @@ export class VoiceProcessingEngine {
     return new Promise((resolve, reject) => {
       const audio = new Audio(audioUrl)
       
-      audio.onended = () => resolve()
-      audio.onerror = () => reject(new Error('Audio playback failed'))
+      audio.onended = () => {
+        this.currentAudio = null
+        resolve()
+      }
+      
+      audio.onerror = () => {
+        this.currentAudio = null
+        reject(new Error('Audio playback failed'))
+      }
       
       // Store reference for interruption
       this.currentAudio = audio
-      audio.play().catch(reject)
+      audio.play().catch((error) => {
+        this.currentAudio = null
+        reject(error)
+      })
     })
   }
-
-  private currentAudio: HTMLAudioElement | null = null
 
   public interruptCurrentResponse(): void {
     if (this.currentAudio) {
@@ -218,7 +340,9 @@ export class VoiceProcessingEngine {
     const dataArray = new Uint8Array(bufferLength)
 
     const detectActivity = () => {
-      this.analyser!.getByteFrequencyData(dataArray)
+      if (!this.analyser) return // Safety check
+
+      this.analyser.getByteFrequencyData(dataArray)
       
       // Calculate RMS for voice activity detection
       let sum = 0
@@ -234,6 +358,7 @@ export class VoiceProcessingEngine {
         this.handleSilence()
       }
 
+      // Continue detection loop
       requestAnimationFrame(detectActivity)
     }
 
@@ -254,7 +379,11 @@ export class VoiceProcessingEngine {
 
     // Start recording if not already
     if (this.mediaRecorder?.state === 'inactive') {
-      this.mediaRecorder.start(100) // 100ms chunks for low latency
+      try {
+        this.mediaRecorder.start(100) // 100ms chunks for low latency
+      } catch (error) {
+        console.error('Failed to start recording:', error)
+      }
     }
   }
 
@@ -264,7 +393,11 @@ export class VoiceProcessingEngine {
     this.silenceTimer = setTimeout(() => {
       // Stop recording after silence period
       if (this.mediaRecorder?.state === 'recording') {
-        this.mediaRecorder.stop()
+        try {
+          this.mediaRecorder.stop()
+        } catch (error) {
+          console.error('Failed to stop recording:', error)
+        }
       }
       this.silenceTimer = null
     }, this.SILENCE_DURATION)
@@ -320,24 +453,39 @@ export class VoiceProcessingEngine {
   }
 
   public cleanup(): void {
-    if (this.mediaRecorder?.state === 'recording') {
-      this.mediaRecorder.stop()
+    try {
+      if (this.mediaRecorder?.state === 'recording') {
+        this.mediaRecorder.stop()
+      }
+    } catch (error) {
+      console.warn('Error stopping MediaRecorder:', error)
     }
     
     if (this.stream) {
       this.stream.getTracks().forEach(track => track.stop())
+      this.stream = null
     }
     
-    if (this.audioContext) {
+    if (this.audioContext && this.audioContext.state !== 'closed') {
       this.audioContext.close()
+      this.audioContext = null
     }
     
     if (this.currentAudio) {
       this.currentAudio.pause()
+      this.currentAudio = null
     }
     
     if (this.silenceTimer) {
       clearTimeout(this.silenceTimer)
+      this.silenceTimer = null
     }
+
+    this.mediaRecorder = null
+    this.analyser = null
+    this.isProcessing = false
+    this.currentProcessingId = null
+    
+    console.log('Voice processing engine cleaned up')
   }
 }

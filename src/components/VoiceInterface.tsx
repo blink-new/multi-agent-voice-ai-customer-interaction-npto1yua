@@ -81,6 +81,22 @@ export function VoiceInterface({ customerId, onCallEnd }: VoiceInterfaceProps) {
     try {
       setIsCallActive(true)
       
+      // Check browser compatibility first
+      const compatibility = VoiceProcessingEngine.checkBrowserCompatibility()
+      if (!compatibility.supported) {
+        throw new Error(`Browser compatibility issues: ${compatibility.issues.join(', ')}`)
+      }
+      
+      // Add loading state to transcript
+      const loadingEntry: TranscriptEntry = {
+        id: 'loading',
+        timestamp: new Date(),
+        speaker: 'agent',
+        text: 'Initializing voice processing engine...',
+        confidence: 1.0
+      }
+      setTranscript([loadingEntry])
+      
       // Initialize voice processing
       voiceEngineRef.current = new VoiceProcessingEngine()
       await voiceEngineRef.current.initialize()
@@ -103,6 +119,16 @@ export function VoiceInterface({ customerId, onCallEnd }: VoiceInterfaceProps) {
     } catch (error) {
       console.error('Failed to start call:', error)
       setIsCallActive(false)
+      
+      // Show error in transcript
+      const errorEntry: TranscriptEntry = {
+        id: 'error',
+        timestamp: new Date(),
+        speaker: 'agent',
+        text: `Sorry, I couldn't initialize the voice system. Error: ${error.message}. Please check your microphone permissions and try again.`,
+        confidence: 1.0
+      }
+      setTranscript([errorEntry])
     }
   }
 
